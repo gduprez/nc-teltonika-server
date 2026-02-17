@@ -1,0 +1,21 @@
+# Exclude build artifacts and target directories
+target/
+target_linux/
+
+# Exclude source control files
+.git/
+.gitignore
+
+# Exclude environment variables
+.env
+
+# Exclude IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.iml
+.DS_Store
+
+# Exclude Docker files themselves (sometimes useful for smaller context)
+Dockerfile
+.dockerignore

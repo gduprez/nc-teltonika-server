@@ -1,0 +1,17 @@
+# Rust
+/target/
+/target_linux/
+**/*.rs.bk
+
+# Environment
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
