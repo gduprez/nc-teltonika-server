@@ -1,14 +1,16 @@
 use reqwest::Client;
 use serde_json::json;
-use std::env;
+use tracing::error;
+use crate::config::get_settings;
 
 pub struct TeamsNotificationService;
 
 impl TeamsNotificationService {
-    const TELTONIKA_SERVER_TEAMS_WEBHOOK: &'static str = "https://nauticoncept.webhook.office.com/webhookb2/3e85c63b-47b3-40b5-aed1-38cd7782b8e3@0b54a401-b5bc-4c03-b505-f690c8c5de4b/IncomingWebhook/41a874a7910a4f09b71baadd3afdb46a/752cea04-da22-4bd2-bed1-a81f4b884fef/V2CTD5qoUoRXUQyO6fvocB37SikQRGLVmkdpXP2YO1SZs1";
-
+    // We could also move this URL to config, but for now leaving as constant or using config if available
+    
     pub async fn note(title: &str, message: &str) {
-        let env = env::var("APP_ENV").unwrap_or_default();
+        let settings = get_settings();
+        let env = &settings.env;
         let title_with_env = format!("({}) {}", env, title);
         
         let payload = json!({
@@ -22,17 +24,22 @@ impl TeamsNotificationService {
         });
 
         let client = Client::new();
-        let _ = client.post(Self::TELTONIKA_SERVER_TEAMS_WEBHOOK)
+        // Use config for URL if set, otherwise fallback to hardcoded (or just use config which has default)
+        let url = &settings.webhook.teams_url;
+        
+        let _ = client.post(url)
             .json(&payload)
             .send()
             .await;
     }
 
     pub async fn sql_error(sql: &str, error: &str) {
-        let env = env::var("APP_ENV").unwrap_or_default();
+        let settings = get_settings();
+        let env = &settings.env;
+        
         // Update to env contains dev
         if env.contains("dev") {
-             println!("SQL Error: {}", error);
+             error!("SQL Error: {}", error);
              return; 
         }
 

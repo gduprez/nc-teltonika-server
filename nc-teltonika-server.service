@@ -1,0 +1,40 @@
+### MANUAL INSTALLATION ###
+# sudo cp nc-teltonika-server.service /etc/systemd/system/
+# sudo systemctl daemon-reload
+# sudo systemctl enable nc-teltonika-server
+# sudo systemctl start nc-teltonika-server
+# sudo systemctl status nc-teltonika-server
+# sudo journalctl -u nc-teltonika-server -f
+
+
+[Unit]
+Description=NC Teltonika Server
+After=network.target
+
+[Service]
+# User/Group to run as. Modify if you create a specific user.
+User=root
+# Group=www-data
+
+# Directory where the binary is located
+WorkingDirectory=/opt/nc-teltonika-server
+
+# Command to start the service
+ExecStart=/opt/nc-teltonika-server/nc-teltonika-server
+
+# Load environment variables from .env file
+EnvironmentFile=/opt/nc-teltonika-server/.env
+
+# Restart policy (requested by user)
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=append:/var/log/nc-teltonika-server/server.log
+StandardError=inherit
+
+# Increase file descriptor limit (important for high connection counts)
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

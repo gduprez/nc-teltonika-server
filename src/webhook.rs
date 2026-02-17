@@ -1,9 +1,12 @@
 use reqwest::Client;
-use std::env;
 use crate::notifications::TeamsNotificationService;
+use crate::config::get_settings;
+use tracing::info;
 
 pub async fn send_webhook_to_nauticoncept_api() {
-     let base_url = env::var("NAUTICONCEPT_API_URL").unwrap_or_default();
+     let settings = get_settings();
+     let base_url = &settings.webhook.nauticoncept_url;
+     
      if base_url.is_empty() {
          return;
      }
@@ -17,7 +20,7 @@ pub async fn send_webhook_to_nauticoncept_api() {
          .send()
          .await 
      {
-         Ok(_) => println!("✅ Sent webhook to Nauticoncept API"),
+         Ok(_) => info!("✅ Sent webhook to Nauticoncept API"),
          Err(e) => {
              TeamsNotificationService::note("❌ Error sending webhook to Nauticoncept", &e.to_string()).await;
          }

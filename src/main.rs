@@ -3,10 +3,13 @@ mod db;
 mod notifications;
 mod utils;
 mod webhook;
+mod monitor;
+pub mod config;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
+use tokio::sync::Semaphore;
 use parser::{TeltonikaParser};
 use db::{init_db, TeltonikaDataRepo};
 use notifications::TeamsNotificationService;
@@ -16,19 +19,29 @@ use bytes::Bytes;
 use std::env;
 use std::sync::Arc;
 use sqlx::PgPool;
-use rlimit::{getrlimit, setrlimit, Resource};
+use tracing::{info, error, debug};
+use rlimit::{setrlimit, getrlimit, Resource};
+use config::get_settings;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load env
     dotenvy::from_path(".env").ok();
-    // Also try to load from ../.env as usually source is in src/
-    // But working dir is rust_version/
-    // The user's env file is mostly in root.
-    // I'll assume they copy .env or run from root.
+
+    // Initialize config (will panic if fails, which is fine for startup)
+    let settings = get_settings();
+
+    // Initialize tracing with JSON support if requested
+    if env::var("RUST_LOG_FORMAT").unwrap_or_default() == "json" {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
     
-    let port = env::var("HTTP_SERVER_PORT").unwrap_or("6000".to_string());
-    let debug = env::var("DEBUG").unwrap_or("false".to_string()) == "1";
+    let port = settings.server.port;
     
     // JS: 1 * 60 * 1000 = 60000 ms = 1 minute.
     let inactive_timeout_ms = 60000; 
@@ -36,8 +49,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, _tunnel) = init_db().await?;
     let pool = Arc::new(pool);
     
+    // Start Monitor Server (Health + Metrics)
+    let monitor_port = settings.server.monitor_port;
+    let monitor_pool = (*pool).clone();
+    tokio::spawn(async move {
+        monitor::start(monitor_port, monitor_pool).await;
+    });
+
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    println!("Server started on port {}", port);
+    info!("Server started on port {}", port);
 
     // Set file descriptor limit
     let fd_limit: u64 = env::var("FILE_DESCRIPTOR_LIMIT")
@@ -46,36 +66,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(10000);
 
     match setrlimit(Resource::NOFILE, fd_limit, fd_limit) {
-        Ok(_) => println!("Successfully set file descriptor limit to {}", fd_limit),
-        Err(e) => println!("Failed to set file descriptor limit to {}: {}", fd_limit, e),
+        Ok(_) => info!("Successfully set file descriptor limit to {}", fd_limit),
+        Err(e) => error!("Failed to set file descriptor limit to {}: {}", fd_limit, e),
     }
 
     // Log current file descriptor limit
     match getrlimit(Resource::NOFILE) {
-        Ok((soft, hard)) => println!("File descriptor limit: soft={}, hard={}", soft, hard),
-        Err(e) => println!("Failed to get file descriptor limit: {}", e),
+        Ok((soft, hard)) => info!("File descriptor limit: soft={}, hard={}", soft, hard),
+        Err(e) => error!("Failed to get file descriptor limit: {}", e),
     }
     
     let version = env!("CARGO_PKG_VERSION");
     TeamsNotificationService::note(&format!("nc-teltonika-server v{} started", version), "").await;
     
+    // Connection Limit
+    let max_connections = 5000;
+    let connection_semaphore = Arc::new(Semaphore::new(max_connections));
+
     loop {
+        // Wait for a permit if we are at limit (backpressure)
+        let permit = match connection_semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Semaphore acquire error: {}", e);
+                break;
+            }
+        };
+
         tokio::select! {
             res = listener.accept() => {
                 match res {
                     Ok((socket, addr)) => {
-                        if debug { println!("client connected: {:?}", addr); }
+                        debug!("client connected: {:?}", addr);
+                        metrics::gauge!("tcp_connections_active").increment(1.0);
                         
                         let pool = pool.clone();
                         tokio::spawn(async move {
-                            handle_client(socket, addr, pool, debug, inactive_timeout_ms).await;
+                            // Hold permit until task finishes
+                            let _permit = permit;
+                            handle_client(socket, addr, pool, inactive_timeout_ms).await;
+                            metrics::gauge!("tcp_connections_active").decrement(1.0);
                         });
                     }
-                    Err(e) => println!("Accept error: {}", e),
+                    Err(e) => {
+                         error!("Accept error: {}", e);
+                         // Don't hold permit if accept failed
+                        drop(permit);
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                println!("Received Ctrl+C, shutting down...");
+                info!("Received Ctrl+C, shutting down...");
                 break;
             }
         }
@@ -84,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_client(mut socket: TcpStream, addr: std::net::SocketAddr, pool: Arc<PgPool>, debug: bool, timeout_ms: u64) {
+async fn handle_client(mut socket: TcpStream, addr: std::net::SocketAddr, pool: Arc<PgPool>, timeout_ms: u64) {
     let mut imei = String::new();
     let mut buf = [0u8; 8192];
     let timeout_duration = Duration::from_millis(timeout_ms);
@@ -94,14 +135,13 @@ async fn handle_client(mut socket: TcpStream, addr: std::net::SocketAddr, pool: 
         
         match read_res {
              Ok(Ok(n)) if n == 0 => {
-                 println!("client disconnected");
+                 debug!("client disconnected");
                  return;
              },
              Ok(Ok(n)) => {
-                 if debug {
-                    println!("Received data from {}, length: {} bytes", addr, n);
-                    println!("{}", hex::encode(&buf[0..n]));
-                 }
+                 metrics::counter!("packets_received_total").increment(1);
+                 debug!("Received data from {}, length: {} bytes", addr, n);
+                 debug!("{}", hex::encode(&buf[0..n]));
                  
                  let data = Bytes::copy_from_slice(&buf[0..n]);
                  
@@ -109,7 +149,7 @@ async fn handle_client(mut socket: TcpStream, addr: std::net::SocketAddr, pool: 
                  let parser = TeltonikaParser::new(data.clone());
                  
                  if parser.invalid {
-                     if debug { println!("❌ Invalid data received, closing connection"); }
+                     debug!("❌ Invalid data received, closing connection");
                      return;
                  }
                  
@@ -126,14 +166,14 @@ async fn handle_client(mut socket: TcpStream, addr: std::net::SocketAddr, pool: 
                          return; // Close if no records? JS: `if (!avl || !avl.number_of_data) c.end()`
                      }
                      
-                     if debug {
-                        for record in &avl.records {
-                            println!("{}", format_record(record));
-                        }
+                     for record in &avl.records {
+                         debug!("{}", format_record(record));
                      }
                      
                      // DB Save
+                     let start = std::time::Instant::now();
                      TeltonikaDataRepo::save_avl_data(&pool, &imei, &avl.records, &hex::encode(&data), "new").await;
+                     metrics::histogram!("db_query_duration_seconds").record(start.elapsed().as_secs_f64());
                      
                      // Webhook
                      send_webhook_to_nauticoncept_api().await;
@@ -144,15 +184,15 @@ async fn handle_client(mut socket: TcpStream, addr: std::net::SocketAddr, pool: 
                      if let Err(_) = socket.write_all(&ack).await {
                           return;
                      }
-                     println!("✅ Sent ACK: {} record(s) to {}", count, addr);
+                     info!("✅ Sent ACK: {} record(s) to {}", count, addr);
                  }
              },
              Err(_) => {
-                 println!("Client timed out due to inactivity");
+                 debug!("Client timed out due to inactivity");
                  return;
              },
              Ok(Err(e)) => {
-                 println!("Error reading from socket: {}", e);
+                 error!("Error reading from socket: {}", e);
                  return;
              }
         }

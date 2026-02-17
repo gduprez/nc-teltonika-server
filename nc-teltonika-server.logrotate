@@ -1,0 +1,8 @@
+/var/log/nc-teltonika-server/*.log {
+    daily
+    rotate 30
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
