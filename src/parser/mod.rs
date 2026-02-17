@@ -41,7 +41,15 @@ impl TeltonikaParser {
              return TeltonikaParser { is_imei: false, imei: None, avl_data: None, invalid: true };
         }
         
-        let _data_length = buf.get_i32(); // advance 4
+        let zeros = buf.slice(0..4);
+        if zeros.as_ref() == [0, 0, 0, 0] {
+             let _preamble = buf.get_u32(); // consume 0000
+             if buf.len() < 4 {
+                 return TeltonikaParser { is_imei: false, imei: None, avl_data: None, invalid: true };
+             }
+        }
+        
+        let _data_length = buf.get_u32(); // advance 4
         let codec_id = buf.get_u8();
         let number_of_data = buf.get_u8();
         

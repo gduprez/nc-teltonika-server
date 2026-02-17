@@ -73,6 +73,7 @@ fn parse_record(buf: &mut Bytes) -> Result<AvlRecord, Box<dyn std::error::Error>
         event_id,
         properties_count,
         io_groups,
+        io_elements: vec![],
     })
 }
 
@@ -124,11 +125,16 @@ fn parse_io_elements(buf: &mut Bytes) -> Result<IoGroup, Box<dyn std::error::Err
         // create_io_element takes i64, so might need adaptation for Double.
         // For now let's assume it fits into something or adapt create_io_element.
         // The JS implementation creates { value: ... } where value is the Double.
-        let value_f64 = buf.get_f64(); 
-        // We'll handle this separately or change create_io_element to take a generic or enum.
-        // IoElement struct has value: String.
-        // So we can convert to string here.
-        n8.push(create_io_element_from_string(id, value_f64.to_string(), value_f64));
+        let value_f64 = buf.get_f64();
+        let value_i64 = value_f64 as i64;
+        let (label, dimension, value_human) = resolve_io_meta(id, value_i64);
+        n8.push(IoElement {
+            id,
+            label,
+            value: serde_json::json!(value_f64),
+            dimension,
+            value_human,
+        });
     }
 
     // X byte IOs
@@ -140,64 +146,53 @@ fn parse_io_elements(buf: &mut Bytes) -> Result<IoGroup, Box<dyn std::error::Err
         let len = buf.get_u16() as usize;
         if buf.remaining() < len { return Err("Not enough bytes for X-byte IO data".into()); }
         let value_bytes = buf.copy_to_bytes(len);
-        let value_hex = hex::encode(value_bytes);
-        nx.push(create_io_element_from_string(id, value_hex.clone(), 0.0)); // 0.0 payload for now, mostly string matters
+        // Decode as UTF-8 string (ICCID, VIN, etc.), fallback to hex
+        let value_str = String::from_utf8(value_bytes.to_vec())
+            .unwrap_or_else(|_| hex::encode(&value_bytes));
+        nx.push(create_io_element_string(id, value_str));
     }
 
     Ok(IoGroup { n1, n2, n4, n8, nx })
 }
 
-fn create_io_element(id: u16, value: i64, _byte_count: u8) -> IoElement {
-     let def = get_io_element_definition(id);
-     let (label, dimension, value_human) = match def {
-         Some(d) => {
-             let val_human = if let Some(values) = d.values {
-                 values.get(&value).unwrap_or(&"").to_string()
-             } else {
-                 "".to_string()
-             };
-             (d.label.to_string(), d.dimension.unwrap_or("").to_string(), val_human)
-         },
-         None => (format!("Unknown-{}", id), "".to_string(), "".to_string()),
-     };
-
-     IoElement {
-         id,
-         value: value.to_string(),
-         label,
-         dimension,
-         value_human,
-     }
+fn resolve_io_meta(id: u16, value: i64) -> (String, Option<String>, Option<String>) {
+    let def = get_io_element_definition(id);
+    match def {
+        Some(d) => {
+            let dimension = d.dimension.map(|s| s.to_string());
+            let value_human = if let Some(values) = d.values {
+                // Only include valueHuman if the key is found in the map
+                values.get(&value).map(|v| v.to_string())
+            } else {
+                // No values map → always include as empty string
+                Some("".to_string())
+            };
+            (d.label.to_string(), dimension, value_human)
+        }
+        None => (format!("Unknown-{}", id), None, Some("".to_string())),
+    }
 }
 
-fn create_io_element_from_string(id: u16, value_str: String, value_num: f64) -> IoElement {
-    // Similar to above but value is already string.
-    // For n8 (double), we might need to look up values using the numeric value cast to i64?
-    // JS `ReadDouble` returns a number. `values[value]` access suggests it checks exact match.
-    // If double is 1.0, it matches 1.
-    
-    let def = get_io_element_definition(id);
-     let (label, dimension, value_human) = match def {
-         Some(d) => {
-             let val_fixed = value_num as i64; // rough cast
-             let val_human = if let Some(values) = d.values {
-                 // Check if float is close to int?
-                 values.get(&val_fixed).unwrap_or(&"").to_string()
-             } else {
-                 "".to_string()
-             };
-             (d.label.to_string(), d.dimension.unwrap_or("").to_string(), val_human)
-         },
-         None => (format!("Unknown-{}", id), "".to_string(), "".to_string()),
-     };
+fn create_io_element(id: u16, value: i64, _byte_count: u8) -> IoElement {
+    let (label, dimension, value_human) = resolve_io_meta(id, value);
+    IoElement {
+        id,
+        label,
+        value: serde_json::Value::Number(serde_json::Number::from(value)),
+        dimension,
+        value_human,
+    }
+}
 
-     IoElement {
-         id,
-         value: value_str,
-         label,
-         dimension,
-         value_human,
-     }
+fn create_io_element_string(id: u16, value_str: String) -> IoElement {
+    let (label, dimension, value_human) = resolve_io_meta(id, 0);
+    IoElement {
+        id,
+        label,
+        value: serde_json::Value::String(value_str),
+        dimension,
+        value_human,
+    }
 }
 
 #[cfg(test)]
@@ -254,5 +249,30 @@ mod tests {
         assert_eq!(r.gps.altitude, 100);
         assert_eq!(r.gps.satellites, 5);
         assert_eq!(r.event_id, 1);
+        assert!(r.io_elements.is_empty());
+    }
+
+    #[test]
+    fn test_bot_payload_match() {
+        // Full payload from bot.js (after preamble, data_length, codec_id, number_of_data)
+        // Original hex: 00000000000000978e01<record_data>0100001e6c
+        // We need to extract just the record portion for codec8e::parse
+        let full_hex = "0000019c6d352b580000000000000000000000000000000000000018000c00010000150500450000711e00b30000c80300ed0200ef0000f000017f0033d20333d30a0008001100100012ffe00013ffe900430e03004600c700b5000000b6000001820000000300090000003b01c100015040032000000000000000010281001438393838333033303030303038363639393833390100001e6c";
+        // Remove trailing: 01 (number_of_data_2) 0000 1e6c (CRC)
+        // Actually the record data ends before the trailing number_of_data and CRC
+        // Trailing bytes: 01 00001e6c = 5 bytes
+        let record_hex = &full_hex[..full_hex.len() - 10]; // remove "0100001e6c"
+        let record_bytes = hex::decode(record_hex).expect("Invalid hex");
+        let mut buf = Bytes::from(record_bytes);
+
+        let records = parse(&mut buf, 1).expect("Failed to parse");
+        assert_eq!(records.len(), 1);
+
+        let json_output = serde_json::to_value(&records).expect("Serialization failed");
+        let expected_json: serde_json::Value = serde_json::from_str(r#"[{"gps": {"angle": 0, "speed": 0, "altitude": 0, "latitude": 0, "longitude": 0, "satellites": 0}, "event_id": 0, "ioGroups": {"n1": [{"id": 1, "label": "Digital Input 1", "value": 0, "valueHuman": "0"}, {"id": 21, "label": "GSM Signal", "value": 5, "valueHuman": "5"}, {"id": 69, "label": "GNSS Status", "value": 0, "valueHuman": "OFF"}, {"id": 113, "label": "Internal Battery level", "value": 30, "dimension": "%", "valueHuman": ""}, {"id": 179, "label": "Digital Output", "value": 0, "valueHuman": ""}, {"id": 200, "label": "Sleep Mode", "value": 3}, {"id": 237, "label": "Network Type", "value": 2, "valueHuman": ""}, {"id": 239, "label": "Ignition", "value": 0, "valueHuman": "No"}, {"id": 240, "label": "Movement", "value": 0, "valueHuman": "No"}, {"id": 383, "label": "Accel calibration", "value": 0, "valueHuman": ""}, {"id": 13266, "label": "Current log file", "value": 3, "valueHuman": ""}, {"id": 13267, "label": "Max log file count", "value": 10, "valueHuman": ""}], "n2": [{"id": 17, "label": "Axis X", "value": 16, "dimension": "mg", "valueHuman": ""}, {"id": 18, "label": "Axis Y", "value": -32, "dimension": "mg", "valueHuman": ""}, {"id": 19, "label": "Axis Z", "value": -23, "dimension": "mg", "valueHuman": ""}, {"id": 67, "label": "Internal Battery Voltage", "value": 3587, "dimension": "mV", "valueHuman": ""}, {"id": 70, "label": "PCB temperature", "value": 199, "dimension": "°C", "valueHuman": ""}, {"id": 181, "label": "PDOP", "value": 0, "dimension": "m", "valueHuman": ""}, {"id": 182, "label": "HDOP", "value": 0, "dimension": "m", "valueHuman": ""}, {"id": 386, "label": "Time from last gnss fix", "value": 0, "dimension": "seconds", "valueHuman": ""}], "n4": [{"id": 9, "label": "Analog Input 1", "value": 59, "dimension": "V", "valueHuman": ""}, {"id": 449, "label": "Ignition On Counter", "value": 86080, "dimension": "seconds", "valueHuman": ""}, {"id": 800, "label": "External Voltage", "value": 0, "dimension": "mV", "valueHuman": ""}], "n8": [], "nx": [{"id": 641, "label": "ICCID", "value": "89883030000086699839", "valueHuman": ""}]}, "priority": 0, "timestamp": "2026-02-17T20:05:27.000Z", "ioElements": [], "properties_count": 24}]"#).expect("Invalid expected JSON");
+
+        assert_eq!(json_output, expected_json, "JSON mismatch!\nGot:\n{}\n\nExpected:\n{}",
+            serde_json::to_string_pretty(&json_output).unwrap(),
+            serde_json::to_string_pretty(&expected_json).unwrap());
     }
 }

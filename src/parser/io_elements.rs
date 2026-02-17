@@ -301,7 +301,7 @@ pub fn get_io_element_definition(id: u16) -> Option<IoElementDefinition> {
         }),
         70 => Some(IoElementDefinition {
             label: "PCB temperature",
-            dimension: Some("deg C"),
+            dimension: Some("°C"),
             values: None,
         }),
         80 => Some(IoElementDefinition {
